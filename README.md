@@ -1,81 +1,53 @@
-# Clipnote
+# Clipnote — free-tier setup
 
-A responsive caption studio for video clips. The browser checks video type and the 100 MB limit, shows a local preview, requests a short-lived signed upload URL, and sends the video directly to a private Google Cloud Storage bucket. Cloud Run downloads the object, asks Gemini to inspect the video and return five distinct caption angles, then removes the bucket object, local temporary file, and Gemini Files API upload. There is no user account or database.
+Clipnote is a responsive caption studio for clips up to 100 MB. This version uses Cloudflare Pages for the website, a Cloudflare Worker for the API, Cloudflare R2 for temporary video storage, and Google Gemini 2.5 Flash-Lite for video understanding.
 
-## Architecture
+## What “free” means here
 
-- **Website:** Vite + React static site, deployable to Cloudflare Pages or Vercel.
-- **Caption API:** FastAPI container on Google Cloud Run (scales to zero; runs independently of your computer).
-- **Video understanding:** Gemini API using `gemini-2.5-flash` by default.
-- **Video storage:** Private Google Cloud Storage bucket, short-lived signed PUT upload, deleted after processing. Cloud Run receives only a small JSON request; the video does not pass through Cloud Run's request-size limit.
-- **Data handling:** Cloud Run enforces 100 MiB, writes a temporary local copy, and attempts object and Gemini file deletion after generation. Failed/incomplete sessions can leave a bucket object behind; configure a lifecycle rule to delete incoming objects after one day. Avoid uploading sensitive/private footage. Provider processing and retention terms apply; review current Google terms before launch.
+The design targets providers’ free tiers, but **no provider promises these tiers will remain free forever**. Free quotas are limited and can change. If the app goes over them, service can stop or fees may apply depending on the provider account and current terms. Check account billing settings before enabling anything paid. The app has no user accounts or usage quotas, so do not share it publicly without adding abuse controls.
 
-## Required settings
+At the time of writing, Cloudflare Pages and Workers have free plans, R2 includes monthly free storage/operation allowances, and Gemini 2.5 Flash-Lite lists free input/output on its free tier. See the current [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/), [R2 pricing](https://developers.cloudflare.com/r2/pricing/), and [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing) before launch. Gemini free-tier requests may be used to improve Google products. Don’t upload private or sensitive clips unless that use is acceptable to you.
 
-Backend (Cloud Run):
+## One-time setup
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `GEMINI_API_KEY` | Yes | Secret API key from Google AI Studio. Store as a Cloud Run secret; never put it in frontend settings. |
-| `ALLOWED_ORIGINS` | Recommended | Comma-separated exact website origins, e.g. `https://clipnote.pages.dev,https://your-domain.com`. Defaults to `*` for initial setup. |
-| `GEMINI_MODEL` | No | Model identifier; defaults to `gemini-2.5-flash`. Check model availability and pricing in your account. |
-| `UPLOAD_BUCKET` | Yes | Name of the private Google Cloud Storage bucket for temporary clips. |
-| `SERVICE_ACCOUNT_EMAIL` | Yes | Cloud Run runtime service account email used to sign short-lived upload URLs. Grant it bucket object permissions and `roles/iam.serviceAccountTokenCreator` on that service account for IAM signing. |
+You need a free Cloudflare account and a Gemini API key from Google AI Studio. The Gemini key stays in the Worker secret store; it is never included in the website.
 
-Website build setting:
+### 1. Create the temporary clip bucket
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `VITE_API_URL` | Yes | Base HTTPS URL of the deployed Cloud Run service (no trailing `/generate`). |
+In Cloudflare Dashboard, open **R2 Object Storage** and create a bucket named `clipnote-clips` using the Standard class. Configure a lifecycle rule to remove objects after one day as a cleanup backstop. Clips are deleted after generation; the lifecycle rule removes abandoned uploads.
 
-## Deploy the API to Google Cloud Run
+### 2. Deploy the Worker API
 
-1. Create a Google Cloud project, enable billing, and enable Cloud Run, Artifact Registry, and Cloud Storage. Install and authenticate the Google Cloud CLI.
-2. Create a Gemini API key in Google AI Studio. Add it to Google Secret Manager as `GEMINI_API_KEY`; do not commit it or paste it into a public setting.
-3. Create a private Cloud Storage bucket in the same region as Cloud Run. Enable CORS for your final website origin and `PUT` method. Example `cors.json`:
+Install Node.js, then from the `worker` folder run:
 
-   ```json
-   [{"origin":["https://YOUR-SITE.pages.dev"],"method":["PUT"],"responseHeader":["Content-Type"],"maxAgeSeconds":3600}]
-   ```
+```sh
+npm install
+npx wrangler login
+npx wrangler secret put GEMINI_API_KEY
+npm run deploy
+```
 
-   Apply it with `gcloud storage buckets update gs://YOUR_BUCKET --cors-file=cors.json`. Add a lifecycle rule to delete objects under `incoming/` after one day as a cleanup backstop. The Cloud Run service identity needs object create, read, and delete access to this bucket, plus `roles/iam.serviceAccountTokenCreator` on itself for IAM signing. Record its email for the environment setting below.
-4. From the `backend` folder, deploy the container (replace the example values):
+Paste the Google AI Studio key when prompted. In the Cloudflare Worker settings, bind the R2 bucket as **`CLIPS`** → `clipnote-clips`. Set Worker variable `ALLOWED_ORIGINS` to the website origin after the Pages site is created (for example `https://clipnote.pages.dev`). Optionally set `GEMINI_MODEL` to another currently free-tier model available to your account. The default is `gemini-2.5-flash-lite`.
 
-   ```sh
-   gcloud run deploy clipnote-api \
-     --source . \
-     --region us-central1 \
-     --allow-unauthenticated \
-     --memory 1Gi \
-     --cpu 1 \
-     --timeout 900 \
-     --concurrency 2 \
-     --max-instances 3 \
-     --set-secrets GEMINI_API_KEY=GEMINI_API_KEY:latest \
-     --set-env-vars ALLOWED_ORIGINS=https://YOUR-SITE.pages.dev,UPLOAD_BUCKET=YOUR_BUCKET,SERVICE_ACCOUNT_EMAIL=YOUR_RUNTIME_SERVICE_ACCOUNT_EMAIL
-   ```
+The Worker API has a `/upload` endpoint that streams the clip into R2 and a `/generate` endpoint that sends it to Gemini, returns five captions, and deletes both temporary files. The upload is capped at 100,000,000 bytes.
 
-   Use the Cloud Run URL shown after deployment as `VITE_API_URL`. Public invocation is needed for a browser-only upload flow. Set `ALLOWED_ORIGINS` to the exact deployed origin(s). For an internet-facing production service, add rate limiting/abuse protection before sharing broadly; this starter intentionally has no accounts or quotas.
+### 3. Publish the site through GitHub and Cloudflare Pages
 
-5. Check `https://YOUR-CLOUD-RUN-URL/health` returns `{"ok":true}`.
+The source repository is [vegasdowntownshows/clipnote-caption-studio](https://github.com/vegasdowntownshows/clipnote-caption-studio). In Cloudflare Dashboard, create a **Pages** project and connect this GitHub repository:
 
-## Deploy the website
+- Framework preset: **Vite**
+- Build command: `npm run build`
+- Build output directory: `dist`
+- Build environment variable: `VITE_API_URL` = your Worker URL, e.g. `https://clipnote-api.YOUR-SUBDOMAIN.workers.dev`
 
-1. Push the `caption-studio` directory to a Git provider, or upload it through a static-host deployment flow.
-2. Choose a Vite/React static project. Build command: `npm run build`; output folder: `dist`.
-3. Add `VITE_API_URL` with the Cloud Run URL, then deploy. Add your final custom domain to both the hosting provider and backend `ALLOWED_ORIGINS`.
-4. If the API CORS setting changes, update the Cloud Run service environment and redeploy.
+Deploy the Pages site. Set the Worker `ALLOWED_ORIGINS` variable to the exact Pages URL, then redeploy the Worker. Visit `/health` on the Worker URL and confirm it returns `{"ok":true}`. The public Pages site is the link you can share.
 
-For local UI development, run `npm install`, set `VITE_API_URL` in a local `.env` file, and run `npm run dev`. Local development is optional; production generation runs in Cloud Run.
+For local frontend work, copy `.env.example` to `.env`, set `VITE_API_URL`, run `npm install`, then `npm run dev`.
 
-## Costs and limits
+## Privacy and practical limits
 
-This is designed for low idle cost: Cloud Run can scale to zero, and a static site host commonly has a free tier. Free quotas, maximum request duration, and billing terms vary by account, region, and change over time. Gemini API video processing is usage-billed and may not be free; video size, duration, model, and current token/audio-video pricing affect cost. A 100 MB file allowance is a maximum upload size, not a promise that every duration/codec will fit within the provider's processing limits. Check current Google Cloud Run, Gemini API, and selected hosting-provider pricing/quotas before publishing. Set billing alerts and API quotas to control spend. No monthly cost can be guaranteed by this project.
-
-## Errors and operational notes
-
-- Only browser-recognized video files up to 100 MiB are accepted; the API checks again.
-- Unsupported formats, oversized videos, empty uploads, provider failures, and missing configuration return user-readable errors.
-- The UI preview uses a local object URL and is revoked when the clip is replaced or removed.
-- Gemini API credentials stay on the backend. Do not expose secrets through `VITE_` variables.
-- The generated captions are suggestions, not a promise of reach or virality. Review factual details and edit into your own voice.
+- Gemini free-tier data handling terms differ from paid-tier terms; review Google’s current policy before use.
+- Uploaded clips live briefly in R2 and Gemini Files API. The Worker attempts deletion when processing finishes; a one-day R2 lifecycle rule cleans up abandoned R2 objects. Gemini Files API also has provider-controlled retention.
+- Provider request-size, video duration, codec, free-tier rate limits, and account eligibility apply. A 100 MB upload allowance does not mean every 100 MB video will be accepted or processed within free quotas.
+- The app is unauthenticated and has no per-user quotas. Anyone who discovers the URL can use its free API allocation. Keep it personal or add authentication/rate limits before sharing.
+- AI captions can be inaccurate. Check names, quotes, and context before posting. Captions do not guarantee reach or virality.

@@ -1,0 +1,10 @@
+name = "clipnote-api"
+main = "src/index.js"
+compatibility_date = "2026-11-08"
+
+[vars]
+ALLOWED_ORIGINS = "https://YOUR-SITE.pages.dev"
+
+[[r2_buckets]]
+binding = "CLIPS"
+bucket_name = "clipnote-clips"
